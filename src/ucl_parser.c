@@ -367,7 +367,7 @@ ucl_check_variable_safe(struct ucl_parser *parser, const char *ptr, size_t remai
 		if (parser->var_handler(ptr, remain, &dst, &dstlen, &need_free,
 								parser->var_data)) {
 			*found = true;
-			*out_len = dstlen;
+			*out_len += dstlen;
 
 			if (need_free) {
 				free(dst);
@@ -453,7 +453,7 @@ ucl_expand_single_variable(struct ucl_parser *parser, const char *ptr,
 						   size_t in_len, unsigned char **dest, size_t out_len)
 {
 	unsigned char *d = *dest, *dst;
-	const char *p = ptr + 1, *ret;
+	const char *p = ptr + 1, *ret, *var_end;
 	struct ucl_variable *var;
 	size_t dstlen;
 	bool need_free = false;
@@ -492,10 +492,12 @@ ucl_expand_single_variable(struct ucl_parser *parser, const char *ptr,
 	}
 
 	if (!found) {
-		if (strict && parser->var_handler != NULL) {
+		if (strict && parser->var_handler != NULL &&
+			(var_end = memchr(p, '}', in_len)) != NULL) {
 			dstlen = out_len;
 
-			if (parser->var_handler(p, in_len, &dst, &dstlen, &need_free,
+			/* Use the same variable name as the length-counting pass. */
+			if (parser->var_handler(p, var_end - p, &dst, &dstlen, &need_free,
 									parser->var_data)) {
 				if (dstlen > out_len) {
 					/* We do not have enough space! */
@@ -505,7 +507,7 @@ ucl_expand_single_variable(struct ucl_parser *parser, const char *ptr,
 				}
 				else {
 					memcpy(d, dst, dstlen);
-					ret += in_len;
+					ret = var_end + 1;
 					d += dstlen;
 					found = true;
 
@@ -2706,18 +2708,13 @@ ucl_state_machine(struct ucl_parser *parser)
 					}
 				}
 
-				/*
-				 * An empty chunk creates the top object without a stack frame:
-				 * reuse that object as the root container instead of parsing
-				 * into a NULL stack.
-				 */
-				if (parser->top_obj == NULL || parser->stack == NULL) {
+				if (parser->top_obj == NULL) {
 					if (parser->state == UCL_STATE_VALUE) {
-						obj = ucl_parser_add_container(parser->top_obj, parser, true, 0,
+						obj = ucl_parser_add_container(NULL, parser, true, 0,
 													   seen_obrace);
 					}
 					else {
-						obj = ucl_parser_add_container(parser->top_obj, parser, false, 0,
+						obj = ucl_parser_add_container(NULL, parser, false, 0,
 													   seen_obrace);
 					}
 
@@ -3322,6 +3319,18 @@ bool ucl_parser_add_chunk_full(struct ucl_parser *parser, const unsigned char *d
 		}
 
 		if (len > 0) {
+			/*
+			 * An empty first chunk exposes an object without starting a parse.
+			 * Replace that placeholder so the first nonempty chunk determines
+			 * the root type and priority, and accounts for the root's cost.
+			 * Real roots, including completed empty containers, stay intact.
+			 */
+			if (parser->top_obj_is_placeholder) {
+				ucl_object_unref(parser->top_obj);
+				parser->top_obj = NULL;
+				parser->top_obj_is_placeholder = false;
+			}
+
 			/* Need to parse something */
 			switch (parse_type) {
 			default:
@@ -3343,6 +3352,7 @@ bool ucl_parser_add_chunk_full(struct ucl_parser *parser, const unsigned char *d
 				 * read something
 				 */
 				parser->top_obj = ucl_object_new_full(UCL_OBJECT, priority);
+				parser->top_obj_is_placeholder = true;
 			}
 
 			return true;
