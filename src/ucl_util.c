@@ -2923,6 +2923,19 @@ ucl_object_iterate_end(const ucl_object_t *obj, ucl_object_iter_t *iter)
 	}
 
 	if (obj != NULL && obj->type == UCL_OBJECT) {
+		const ucl_object_t *cur;
+
+		/*
+		 * Without expand_values, the iterator is a position in obj's own
+		 * list of objects, not a hash iterator: nothing to free.
+		 */
+		for (cur = obj; cur != NULL; cur = cur->next) {
+			if (cur == *iter) {
+				*iter = NULL;
+				return;
+			}
+		}
+
 		ucl_hash_iterate_free(*iter);
 	}
 
@@ -3383,19 +3396,33 @@ bool ucl_array_merge(ucl_object_t *top, ucl_object_t *elt, bool copy)
 	UCL_ARRAY_GET(v2, cp);
 
 	if (v1 && v2) {
+		size_t old_n = v1->n;
+
 		kv_concat_safe(ucl_object_t *, *v1, *v2, e0);
 
-		for (i = v2->n; i < v1->n; i++) {
+		for (i = old_n; i < v1->n; i++) {
 			obj = &kv_A(*v1, i);
 			if (*obj == NULL) {
 				continue;
 			}
+			if (!copy) {
+				/* Now held by both arrays */
+				ucl_object_ref(*obj);
+			}
 			top->len++;
+		}
+
+		if (copy) {
+			/* The copied elements now belong to top */
+			v2->n = 0;
 		}
 	}
 
+	ucl_object_unref(cp);
+
 	return true;
 e0:
+	ucl_object_unref(cp);
 	return false;
 }
 
@@ -3967,6 +3994,7 @@ int ucl_object_compare(const ucl_object_t *o1, const ucl_object_t *o2)
 					break;
 				}
 			}
+			ucl_object_iterate_end(o1, &iter);
 		}
 		else {
 			ret = o1->len - o2->len;
