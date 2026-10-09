@@ -1302,6 +1302,12 @@ ucl_msgpack_consume(struct ucl_parser *parser)
 
 		ret = obj_parser->func(parser, container, len, obj_parser->fmt,
 							   p, remain);
+		/*
+		 * The callback can still fail here: an empty container merged into
+		 * an existing one of the other kind is rejected inside it, and
+		 * ignoring that reported success with an error string attached
+		 */
+		CONSUME_RET;
 		break;
 
 	case read_array_value:
@@ -1402,7 +1408,6 @@ ucl_msgpack_release_tree(struct ucl_parser *parser)
 
 bool ucl_parse_msgpack(struct ucl_parser *parser)
 {
-	ucl_object_t *container = NULL;
 	const unsigned char *p;
 	bool ret;
 
@@ -1414,13 +1419,31 @@ bool ucl_parse_msgpack(struct ucl_parser *parser)
 	p = parser->chunks->begin;
 
 	/*
+	 * A msgpack parse never leaves frames behind: a success unwinds every
+	 * container and a failure drops them all in ucl_msgpack_release_tree.
+	 * Frames still on the stack therefore belong to another parser - the ucl
+	 * state machine's implicit top object, whose frames count elements in a
+	 * different union member and whose object the ucl parser owns as its
+	 * top_obj. Continuing such a container from msgpack cannot work, and
+	 * worse: on a later failure release_tree would unref that bottom frame's
+	 * object, and ucl_parser_free would unref it a second time.
+	 */
+	if (parser->stack != NULL) {
+		ucl_create_err(&parser->err,
+					   "msgpack cannot continue inside a container opened "
+					   "by another parser");
+
+		return false;
+	}
+
+	/*
 	 * A msgpack document carries its own root, so a second one has nowhere
 	 * to go: there is no defined way to merge it into a tree that is already
 	 * built. Saying so is better than parsing it and dropping it on the
 	 * floor, which is what happened before - the result was discarded along
 	 * with everything it allocated.
 	 */
-	if (parser->stack == NULL && parser->top_obj != NULL) {
+	if (parser->top_obj != NULL) {
 		ucl_create_err(&parser->err,
 					   "msgpack documents cannot be concatenated: the parser "
 					   "already holds a top level object");
@@ -1428,20 +1451,13 @@ bool ucl_parse_msgpack(struct ucl_parser *parser)
 		return false;
 	}
 
-	if (parser->stack) {
-		container = parser->stack->obj;
-	}
-
 	/*
-	 * When we start parsing message pack chunk, we must ensure that we
-	 * have either a valid container or the top object inside message pack is
-	 * of container type
+	 * When we start parsing message pack chunk, we must ensure that the top
+	 * object inside message pack is of container type
 	 */
-	if (container == NULL) {
-		if ((*p & 0x80) != 0x80 && !(*p >= 0xdc && *p <= 0xdf)) {
-			ucl_create_err(&parser->err, "bad top level object for msgpack");
-			return false;
-		}
+	if ((*p & 0x80) != 0x80 && !(*p >= 0xdc && *p <= 0xdf)) {
+		ucl_create_err(&parser->err, "bad top level object for msgpack");
+		return false;
 	}
 
 	ret = ucl_msgpack_consume(parser);
@@ -1463,6 +1479,20 @@ ucl_msgpack_parse_map(struct ucl_parser *parser,
 					  struct ucl_stack *container, size_t len, enum ucl_msgpack_format fmt,
 					  const unsigned char *pos, size_t remain)
 {
+	/*
+	 * A merge may have handed the value to an older container of the other
+	 * kind: a map decodes its elements as key/value pairs and an array as
+	 * single values, so mixing the two would quietly decode one as the
+	 * other - map keys would be dropped on the way into an array, and array
+	 * elements would arrive at a map with no key at all.
+	 */
+	if (parser->cur_obj->type != UCL_OBJECT) {
+		ucl_create_err(&parser->err,
+					   "cannot merge a msgpack map into an array");
+
+		return -1;
+	}
+
 	container->obj = parser->cur_obj;
 
 	return 0;
@@ -1473,6 +1503,14 @@ ucl_msgpack_parse_array(struct ucl_parser *parser,
 						struct ucl_stack *container, size_t len, enum ucl_msgpack_format fmt,
 						const unsigned char *pos, size_t remain)
 {
+	/* The mirror image of the check in ucl_msgpack_parse_map */
+	if (parser->cur_obj->type != UCL_ARRAY) {
+		ucl_create_err(&parser->err,
+					   "cannot merge a msgpack array into an object");
+
+		return -1;
+	}
+
 	container->obj = parser->cur_obj;
 
 	return 0;

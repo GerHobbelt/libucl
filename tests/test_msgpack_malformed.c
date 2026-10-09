@@ -331,6 +331,145 @@ test_userdata_emit(void)
 	ucl_object_unref(top);
 }
 
+/*
+ * A ucl chunk leaves its implicit top object on the parser stack, and that
+ * object is also parser->top_obj. A failing msgpack chunk used to run
+ * ucl_msgpack_release_tree over those frames, unref that object and leave
+ * ucl_parser_free to unref it a second time. The mixed state must be refused
+ * instead, without disturbing the ucl parser's own bookkeeping.
+ */
+static void
+test_after_ucl_open_object(void)
+{
+	/* 0x92 0x01 = array(2) with a single element, truncated */
+	const unsigned char bad[] = {0x92, 0x01};
+	struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_DISABLE_MACRO);
+	ucl_object_t *obj;
+	const ucl_object_t *elt;
+
+	if (!ucl_parser_add_string(parser, "a = 1\n", 6)) {
+		ucl_parser_free(parser);
+		FAIL("%s", "the ucl chunk should parse");
+	}
+
+	if (ucl_parser_add_chunk_full(parser, bad, sizeof(bad),
+								  0, UCL_DUPLICATE_APPEND, UCL_PARSE_MSGPACK)) {
+		ucl_parser_free(parser);
+		FAIL("%s", "msgpack after an open ucl object should be refused");
+	}
+
+	/* The refusal must leave the ucl parser intact and usable */
+	if (!ucl_parser_add_string(parser, "b = 2\n", 6)) {
+		ucl_parser_free(parser);
+		FAIL("%s", "the ucl parser should survive the refused msgpack chunk");
+	}
+
+	obj = ucl_parser_get_object(parser);
+
+	if (obj == NULL) {
+		ucl_parser_free(parser);
+		FAIL("%s", "no object after the mixed chunks");
+	}
+
+	elt = ucl_object_lookup(obj, "b");
+
+	if (elt == NULL || ucl_object_toint(elt) != 2) {
+		ucl_object_unref(obj);
+		ucl_parser_free(parser);
+		FAIL("%s", "the chunk after the refusal was lost");
+	}
+
+	ucl_object_unref(obj);
+	ucl_parser_free(parser);
+}
+
+/*
+ * Merging across container kinds used to decode the incoming container as
+ * the survivor's kind: map keys were dropped on the way into an array, and
+ * array elements reached a map with no key at all. Same-kind merges must
+ * keep working.
+ */
+static void
+test_merge_container_type_mismatch(void)
+{
+	/* {"a": [7], "a": {"x":1}} */
+	static const unsigned char map_into_array[] = {
+		0x82,
+		0xa1, 0x61, 0x91, 0x07,
+		0xa1, 0x61, 0x81, 0xa1, 0x78, 0x01};
+	/* {"a": {"x":1}, "a": [9,9]} */
+	static const unsigned char array_into_map[] = {
+		0x82,
+		0xa1, 0x61, 0x81, 0xa1, 0x78, 0x01,
+		0xa1, 0x61, 0x92, 0x09, 0x09};
+	/* {"a": {"x":1}, "a": {"y":2}} merges to {"a":{"x":1,"y":2}} */
+	static const unsigned char map_into_map[] = {
+		0x82,
+		0xa1, 0x61, 0x81, 0xa1, 0x78, 0x01,
+		0xa1, 0x61, 0x81, 0xa1, 0x79, 0x02};
+	/* {"a": [7], "a": [8]} merges to {"a":[7,8]} */
+	static const unsigned char array_into_array[] = {
+		0x82,
+		0xa1, 0x61, 0x91, 0x07,
+		0xa1, 0x61, 0x91, 0x08};
+	/*
+	 * Empty containers at the very end of input: the finishing state used
+	 * to ignore the type check's verdict and report success with the error
+	 * string attached
+	 */
+	/* {"a": [7], "a": {}} */
+	static const unsigned char empty_map_into_array[] = {
+		0x82,
+		0xa1, 0x61, 0x91, 0x07,
+		0xa1, 0x61, 0x80};
+	/* {"a": {"x":1}, "a": []} */
+	static const unsigned char empty_array_into_map[] = {
+		0x82,
+		0xa1, 0x61, 0x81, 0xa1, 0x78, 0x01,
+		0xa1, 0x61, 0x90};
+	/* {"a": {"x":1}, "a": {}} merges to {"a":{"x":1}} */
+	static const unsigned char empty_map_into_map[] = {
+		0x82,
+		0xa1, 0x61, 0x81, 0xa1, 0x78, 0x01,
+		0xa1, 0x61, 0x80};
+	static const struct {
+		const char *what;
+		const unsigned char *data;
+		size_t len;
+		bool must_fail;
+	} cases[] = {
+		{"map into array", map_into_array, sizeof(map_into_array), true},
+		{"array into map", array_into_map, sizeof(array_into_map), true},
+		{"map into map", map_into_map, sizeof(map_into_map), false},
+		{"array into array", array_into_array, sizeof(array_into_array),
+		 false},
+		{"empty map into array", empty_map_into_array,
+		 sizeof(empty_map_into_array), true},
+		{"empty array into map", empty_array_into_map,
+		 sizeof(empty_array_into_map), true},
+		{"empty map into map", empty_map_into_map,
+		 sizeof(empty_map_into_map), false}};
+	size_t i;
+
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		struct ucl_parser *parser = ucl_parser_new(UCL_PARSER_DISABLE_MACRO);
+		bool ok;
+
+		ok = ucl_parser_add_chunk_full(parser, cases[i].data, cases[i].len,
+									   0, UCL_DUPLICATE_MERGE,
+									   UCL_PARSE_MSGPACK);
+
+		if (ok != !cases[i].must_fail) {
+			ucl_parser_free(parser);
+			FAIL("merge %s: %s", cases[i].what,
+				 ok ? "accepted a cross-kind merge" :
+					  "rejected a same-kind merge");
+		}
+
+		ucl_parser_free(parser);
+	}
+}
+
 /* ------------------------------------------------------------------ */
 
 int
@@ -357,6 +496,8 @@ main(void)
 	test_uint64_max_ok();
 	test_no_concatenation();
 	test_userdata_emit();
+	test_after_ucl_open_object();
+	test_merge_container_type_mismatch();
 
 	if (failed) {
 		fprintf(stderr, "%d test(s) FAILED\n", failed);
